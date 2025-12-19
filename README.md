@@ -60,6 +60,34 @@ To deploy the bridge to Google Cloud Run:
 
 The script will build the container image via Cloud Build, deploy it to Cloud Run, and provide you with the final **WebSocket URL**.
 
+## AWS Deployment (App Runner)
+
+To deploy the bridge to AWS App Runner:
+
+1. **Ensure AWS CLI and Docker are installed and configured**:
+   ```bash
+   aws configure
+   ```
+
+2. **Set required variables**:
+   ```bash
+   export ELEVENLABS_AGENT_ID="your_agent_id"
+   export ELEVENLABS_API_KEY="your_api_key"
+   ```
+
+3. **Run the deployment script**:
+   ```bash
+   chmod +x deploy_aws.sh
+   ./deploy_aws.sh
+   ```
+
+**What the script does for you:**
+- Creates the necessary **IAM Role** (`AppRunnerECRAccessRole`) with correct trust policies.
+- Creates a private **ECR Repository** if it doesn't exist.
+- Builds and pushes the Docker image to ECR.
+- Creates or updates the **App Runner service** with the specified configuration.
+- Configures environment variables and ports (10002).
+
 ## Exotel Configuration
 
 In your Exotel Passthru or Connect app, set the WebSocket URL to:
