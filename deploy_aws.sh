@@ -8,9 +8,14 @@ set -e
 
 # Configuration
 SERVICE_NAME="exotel-bridge"
-REGION="us-east-1" # Change as needed
+AWS_REGION="${AWS_REGION:-ap-south-1}"  # Default to Mumbai for lower latency to India
 ECR_REPO_NAME="exotel-bridge-repo"
 ROLE_NAME="AppRunnerECRAccessRole"
+
+# ElevenLabs region configuration
+# Options: default, us, eu, india
+# For India residency, use "india" which connects to api.in.residency.elevenlabs.io
+ELEVENLABS_REGION="${ELEVENLABS_REGION:-india}"
 
 # Check for required environment variables
 if [ -z "$ELEVENLABS_AGENT_ID" ]; then
@@ -22,6 +27,26 @@ fi
 if [ -z "$ELEVENLABS_API_KEY" ]; then
     echo "Warning: ELEVENLABS_API_KEY is not set."
 fi
+
+echo "=============================================="
+echo "ElevenLabs Configuration:"
+echo "  Agent ID: $ELEVENLABS_AGENT_ID"
+echo "  Region:   $ELEVENLABS_REGION"
+case "$ELEVENLABS_REGION" in
+    "india")
+        echo "  API URL:  wss://api.in.residency.elevenlabs.io"
+        ;;
+    "eu")
+        echo "  API URL:  wss://api.eu.residency.elevenlabs.io"
+        ;;
+    "us")
+        echo "  API URL:  wss://api.us.elevenlabs.io"
+        ;;
+    *)
+        echo "  API URL:  wss://api.elevenlabs.io"
+        ;;
+esac
+echo "=============================================="
 
 # Check if AWS CLI is installed
 if ! command -v aws &> /dev/null; then
@@ -36,7 +61,7 @@ if [ -z "$ACCOUNT_ID" ]; then
     exit 1
 fi
 
-echo "Deploying $SERVICE_NAME to AWS account $ACCOUNT_ID in $REGION..."
+echo "Deploying $SERVICE_NAME to AWS account $ACCOUNT_ID in $AWS_REGION..."
 
 # 1. Setup IAM Role for App Runner
 echo "Checking IAM role: $ROLE_NAME..."
@@ -76,18 +101,18 @@ ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME"
 
 # 2. Create ECR Repository if it doesn't exist
 echo "Checking ECR repository: $ECR_REPO_NAME..."
-if ! aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$REGION" > /dev/null 2>&1; then
+if ! aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$AWS_REGION" > /dev/null 2>&1; then
     echo "Creating ECR repository..."
-    aws ecr create-repository --repository-name "$ECR_REPO_NAME" --region "$REGION"
+    aws ecr create-repository --repository-name "$ECR_REPO_NAME" --region "$AWS_REGION"
 fi
 
 # 3. Login to ECR
 echo "Logging into ECR..."
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
 # 4. Build and Push Image
 echo "Building container image..."
-IMAGE_URL="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPO_NAME:latest"
+IMAGE_URL="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:latest"
 docker build -t "$ECR_REPO_NAME" .
 docker tag "$ECR_REPO_NAME:latest" "$IMAGE_URL"
 
@@ -96,13 +121,13 @@ docker push "$IMAGE_URL"
 
 # 5. Deploy to App Runner
 echo "Checking for existing App Runner service..."
-SERVICE_ARN=$(aws apprunner list-services --region "$REGION" --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn" --output text)
+SERVICE_ARN=$(aws apprunner list-services --region "$AWS_REGION" --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn" --output text)
 
 if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" == "None" ]; then
     echo "Creating new App Runner service..."
     aws apprunner create-service \
         --service-name "$SERVICE_NAME" \
-        --region "$REGION" \
+        --region "$AWS_REGION" \
         --source-configuration "{
             \"AuthenticationConfiguration\": {
                 \"AccessRoleArn\": \"$ROLE_ARN\"
@@ -111,10 +136,11 @@ if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" == "None" ]; then
                 \"ImageIdentifier\": \"$IMAGE_URL\",
                 \"ImageConfiguration\": {
                     \"Port\": \"10002\",
-                    \"RuntimeEnvironmentVariables\": [
-                        { \"Name\": \"ELEVENLABS_AGENT_ID\", \"Value\": \"$ELEVENLABS_AGENT_ID\" },
-                        { \"Name\": \"ELEVENLABS_API_KEY\", \"Value\": \"$ELEVENLABS_API_KEY\" }
-                    ]
+                    \"RuntimeEnvironmentVariables\": {
+                        \"ELEVENLABS_AGENT_ID\": \"$ELEVENLABS_AGENT_ID\",
+                        \"ELEVENLABS_API_KEY\": \"$ELEVENLABS_API_KEY\",
+                        \"ELEVENLABS_REGION\": \"$ELEVENLABS_REGION\"
+                    }
                 },
                 \"ImageRepositoryType\": \"ECR\"
             }
@@ -123,22 +149,55 @@ else
     echo "Updating existing App Runner service: $SERVICE_ARN"
     aws apprunner update-service \
         --service-arn "$SERVICE_ARN" \
-        --region "$REGION" \
+        --region "$AWS_REGION" \
         --source-configuration "{
+            \"AuthenticationConfiguration\": {
+                \"AccessRoleArn\": \"$ROLE_ARN\"
+            },
             \"ImageRepository\": {
                 \"ImageIdentifier\": \"$IMAGE_URL\",
                 \"ImageConfiguration\": {
-                    \"Port\": \"10002\"
-                }
+                    \"Port\": \"10002\",
+                    \"RuntimeEnvironmentVariables\": {
+                        \"ELEVENLABS_AGENT_ID\": \"$ELEVENLABS_AGENT_ID\",
+                        \"ELEVENLABS_API_KEY\": \"$ELEVENLABS_API_KEY\",
+                        \"ELEVENLABS_REGION\": \"$ELEVENLABS_REGION\"
+                    }
+                },
+                \"ImageRepositoryType\": \"ECR\"
             }
         }"
 fi
 
-echo -e "\n=========================================="
+# Wait for service to be ready and get the URL
+echo -e "\nWaiting for service to be ready..."
+sleep 5
+
+SERVICE_URL=$(aws apprunner describe-service \
+    --service-arn "$(aws apprunner list-services --region "$AWS_REGION" --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn" --output text)" \
+    --region "$AWS_REGION" \
+    --query "Service.ServiceUrl" \
+    --output text 2>/dev/null || echo "")
+
+echo -e "\n=============================================="
 echo "Deployment initiated!"
-echo "Service: $SERVICE_NAME"
-echo "Region: $REGION"
-echo "=========================================="
-echo "You can monitor the status with:"
-echo "aws apprunner list-services --region $REGION --query \"ServiceSummaryList[?ServiceName=='$SERVICE_NAME']\""
-echo -e "==========================================\n"
+echo "=============================================="
+echo "Service:     $SERVICE_NAME"
+echo "AWS Region:  $AWS_REGION"
+echo "EL Region:   $ELEVENLABS_REGION"
+if [ -n "$SERVICE_URL" ] && [ "$SERVICE_URL" != "None" ]; then
+    echo "----------------------------------------------"
+    echo "WebSocket URL for Exotel:"
+    echo "  wss://$SERVICE_URL/media"
+    echo ""
+    echo "Health Check:"
+    echo "  https://$SERVICE_URL/health"
+fi
+echo "=============================================="
+echo ""
+echo "Monitor deployment status:"
+echo "  aws apprunner list-services --region $AWS_REGION --query \"ServiceSummaryList[?ServiceName=='$SERVICE_NAME']\""
+echo ""
+echo "View logs:"
+echo "  aws apprunner list-operations --service-arn <SERVICE_ARN> --region $AWS_REGION"
+echo "=============================================="
